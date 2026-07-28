@@ -1,0 +1,2 @@
+{"ts":"2026-07-27T12:00:00Z","source":"market_ws","type":"book","payload":{"event_type":"book","asset_id":"sample-token","market":"0xsample","bids":[{"price":"0.49","size":"100"}],"asks":[{"price":"0.50","size":"100"}],"timestamp":"1785171600000"}}
+{"ts":"2026-07-27T12:00:04Z","source":"target_tracker","type":"target_position_change","payload":{"address":"0x1111111111111111111111111111111111111111","token_id":"sample-token","condition_id":"0xsample","before_size":"0","after_size":"100","size_delta":"100","price_hint":"0.50","observed_at":"2026-07-27T12:00:04Z"}}

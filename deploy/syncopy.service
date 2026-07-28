@@ -1,0 +1,26 @@
+[Unit]
+Description=Syncopy Polymarket copy trader
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=syncopy
+Group=syncopy
+WorkingDirectory=/opt/syncopy
+EnvironmentFile=/etc/syncopy/syncopy.env
+ExecStartPre=/opt/syncopy/.venv/bin/alembic upgrade head
+ExecStart=/opt/syncopy/.venv/bin/syncopy run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=25
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/syncopy
+
+[Install]
+WantedBy=multi-user.target
+
