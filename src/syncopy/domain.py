@@ -78,6 +78,15 @@ class TargetPositionChange:
 
 
 @dataclass(frozen=True, slots=True)
+class SignalEvent:
+    token_id: str
+    desired_size: Decimal
+    price_hint: Decimal | None
+    reason: str
+    observed_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(frozen=True, slots=True)
 class SizingInput:
     target_size: Decimal
     target_capital: Decimal

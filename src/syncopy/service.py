@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from decimal import Decimal
 
 import aiohttp
 import structlog
@@ -10,7 +9,7 @@ import uvicorn
 from syncopy.clients import ClobApi, DataApi, GammaApi
 from syncopy.config import Settings
 from syncopy.db import Database, Repository
-from syncopy.domain import ZERO, Freshness, SizingInput, TargetPositionChange
+from syncopy.domain import SignalEvent, TargetPositionChange
 from syncopy.events import EventWriter
 from syncopy.execution import ExecutionEngine, PolymarketExecutor
 from syncopy.health import create_app
@@ -18,8 +17,8 @@ from syncopy.ingest import MarketIngestor
 from syncopy.markets import MarketRegistry
 from syncopy.reconcile import Reconciler
 from syncopy.risk import RiskManager
+from syncopy.signal import CopyTradingSignalSource
 from syncopy.state import RuntimeState
-from syncopy.strategy import PositionSizer
 from syncopy.tls import default_ssl_context
 from syncopy.tracker import TargetTracker
 
@@ -53,6 +52,16 @@ class SyncopyService:
         self._stopped = asyncio.Event()
         self._shutdown_lock = asyncio.Lock()
         self._token_locks: dict[str, asyncio.Lock] = {}
+        self.copy_trading_source = CopyTradingSignalSource(
+            state=self.state,
+            settings=self.settings,
+            token_locks=self._token_locks,
+            get_ingestor=lambda: self.ingestor,
+            get_markets=lambda: self.markets,
+            get_reconciler=lambda: self.reconciler,
+            get_events=lambda: self.events,
+            on_signal=self._on_signal_event,
+        )
         self._server: uvicorn.Server | None = None
 
     async def start(self) -> None:
@@ -218,75 +227,13 @@ class SyncopyService:
             self.request_stop()
 
     async def _on_target_change(self, change: TargetPositionChange) -> None:
-        assert self.ingestor is not None
-        assert self.reconciler is not None
-        assert self.markets is not None
-        assert self.execution is not None
-        assert self.events is not None
-        self.ingestor.add_assets([change.token_id])
-        lock = self._token_locks.setdefault(change.token_id, asyncio.Lock())
-        async with lock:
-            reference = next(
-                (
-                    positions[change.token_id]
-                    for positions in self.state.target_positions.values()
-                    if change.token_id in positions
-                ),
-                None,
-            )
-            await self.markets.ensure(change.token_id, position=reference)
-            book = self.state.books.get(change.token_id)
-            if book is None or book.freshness is Freshness.STALE:
-                if not await self.reconciler.refresh_book(change.token_id):
-                    return
-                book = self.state.books[change.token_id]
-            price = book.mid or book.best_ask or book.best_bid
-            if price is None or price <= ZERO:
-                return
-            raw = ZERO
-            target_entries: list[tuple[Decimal, Decimal, Decimal]] = []
-            for address, weight in self.settings.targets.items():
-                position = self.state.target_positions.get(address, {}).get(change.token_id)
-                target_size = position.size if position else ZERO
-                capital = self.settings.target_capital(address)
-                raw += target_size * (self.settings.own_capital_usd / capital) * weight
-                target_entries.append((target_size, capital, weight))
-            current = self.state.own_positions.get(change.token_id)
-            current_size = current.size if current else ZERO
-            from syncopy.domain import Side
+        await self.copy_trading_source.on_target_change(change)
 
-            side = Side.BUY if raw >= current_size else Side.SELL
-            depth = book.depth_within(side, self.settings.slippage_tolerance_pct)
-            sizer = PositionSizer(
-                max_depth_fraction=self.settings.max_depth_fraction,
-                max_market_exposure_pct=self.settings.max_market_exposure_pct,
-            )
-            result = sizer.size_aggregate(
-                SizingInput(
-                    target_size=target_size,
-                    target_capital=capital,
-                    own_capital=self.settings.own_capital_usd,
-                    market_price=price,
-                    depth_shares=depth,
-                    target_weight=weight,
-                )
-                for target_size, capital, weight in target_entries
-            )
-            await self.events.emit(
-                "strategy",
-                "sizing_decision",
-                {
-                    "token_id": change.token_id,
-                    "desired_size": str(result.desired_size),
-                    "raw_mirror": str(result.raw_mirror),
-                    "liquidity_cap": str(result.liquidity_cap),
-                    "risk_cap_shares": str(result.risk_cap_shares),
-                    "limiting_factor": result.limiting_factor,
-                },
-            )
-            await self.execution.process(
-                change.token_id,
-                result.desired_size,
-                reason=f"target change {change.address} delta={change.size_delta}",
-                price_hint=change.price_hint,
-            )
+    async def _on_signal_event(self, event: SignalEvent) -> None:
+        assert self.execution is not None
+        await self.execution.process(
+            event.token_id,
+            event.desired_size,
+            reason=event.reason,
+            price_hint=event.price_hint,
+        )
