@@ -6,6 +6,10 @@ positions through any public or institutional API. Copy trading is not implement
 venue by design. This document maps what must change to pivot the signal source while keeping the
 reconciliation, sizing, risk, and backtesting layers intact.
 
+**Target venues:** polymarket.us (CFTC-regulated; polymarket-us SDK; public market data at
+`gateway.polymarket.us`; trading at `api.polymarket.us`) and Kalshi (CFTC-regulated). Offshore
+Polymarket (polymarket.com) is **out of scope for live trading**.
+
 Leading replacement strategy: cross-venue dislocation between polymarket.us and Kalshi (both
 CFTC-regulated, US-legal), trading the spread when the same outcome is priced differently.
 
@@ -46,6 +50,8 @@ These modules have no structural dependence on copy trading or wallets:
 | `events.py`, `db.py:Repository` (most of it), `health.py`, `domain.py` (most) | Pure infrastructure |
 
 **Rough count of lines to change:** tracker (~155 lines), `reconcile_target` (~40 lines), copy-trading config validators (~40 lines), `service._on_target_change` (~70 lines), `DataApi` (~45 lines). That is roughly 350 lines of signal-coupled code out of ~2,200 total. The execution, sizing, risk, and ingest machinery is intact.
+
+**Note on adapters:** `execution.py`, `ingest.py`, `markets.py`, and `clients.py` are all specific to offshore Polymarket — they depend on the CLOB WebSocket protocol, the Polymarket data indexer, and on-chain EVM infrastructure. None of them can be reused for polymarket.us. Each will require a dedicated polymarket.us adapter built against the polymarket-us SDK and `gateway.polymarket.us` / `api.polymarket.us` endpoints.
 
 ---
 
@@ -145,7 +151,7 @@ Confirm the seam, lock `DRY_RUN=True`, do not touch execution or sizing math.
 
 ---
 
-### Phase 1: Extract `SignalEvent` and a `SignalSource` protocol (pure refactor, no behavior change)
+### Phase 1: Extract `SignalEvent` and a `SignalSource` protocol (pure refactor, no behavior change) — **COMPLETE**
 
 Goal: establish the interface without breaking anything. The copy-trading machinery still runs.
 
@@ -180,38 +186,79 @@ validated at parse time for a non-copy-trading source.
 
 ---
 
-### Phase 3: Implement `DislocaitonSignalSource`
+### Phase 3: polymarket.us read-only market data adapter
 
-Goal: ingest price from two venues, emit `SignalEvent` when spread threshold is breached.
+Goal: fetch and normalize market data from polymarket.us using the polymarket-us SDK and
+`gateway.polymarket.us`. No trading; no auth required beyond public endpoints.
 
-1. Add `KalshiApi` client (REST + WS) analogous to `ClobApi` / `MarketIngestor`. The book data
-   maps directly into `OrderBook`.
-2. Add a market mapping config: `dislocation_pairs` — a list of
-   `{polymarket_token_id, kalshi_market_id, spread_threshold_pct}`.
-3. `DislocaitonSignalSource.run()` subscribes to both venues' order books, computes mid-price
-   spread on each tick, and emits `SignalEvent(desired_size=X)` when spread ≥ threshold. The
-   sizing is based on own capital and spread magnitude, not on mirroring a target — but it still
-   flows through the same `PositionSizer` with a synthetic `SizingInput`.
-4. Wire it into `service.start()` under `source_type == "dislocation"`. `TargetTracker` and
-   `reconcile_target` are simply not started.
+1. Add a `PolymarketUSMarketApi` client that wraps the polymarket-us SDK.
+2. Expose `market_info(token_id)` and `order_book(token_id)` returning the same types (`Market`,
+   `OrderBook`) that the rest of the stack already consumes.
+3. Write a `PolymarketUSIngestor` that subscribes to the order-book feed from `gateway.polymarket.us`
+   and produces `OrderBook` updates — same output contract as the existing `MarketIngestor`.
+4. Add a `PolymarketUSMarketRegistry` analogous to `MarketRegistry`, backed by the new client.
 
-`reconcile_own()` continues to work: for polymarket.us it calls an authenticated REST endpoint
-scoped to your account — just a different `DataApi`-equivalent client.
+Existing `ingest.py`, `markets.py`, and `clients.py` are **not** modified; the new files live
+alongside them.
 
 ---
 
-### Phase 4: Schema migration (lowest urgency, do last)
+### Phase 4: Kalshi read-only market data adapter
 
-The `targets` / `target_positions` tables are useful audit history regardless of signal source.
-Two options:
+Goal: same normalized interface, different venue.
 
-- **Rename** `TargetRow.address` → `TargetRow.source_id` (`String(200)`, drop the 42-char cap),
-  add `source_type` column, write an Alembic migration.
-- **Add a new table** `signal_sources` for the dislocation strategy and leave the existing
-  copy-trading tables as historical record.
+1. Add a `KalshiMarketApi` client (REST) exposing `market_info(ticker)` and `order_book(ticker)`.
+2. Add a `KalshiIngestor` subscribing to Kalshi's WS order-book feed.
+3. Add a `KalshiMarketRegistry`.
 
-The second option is safer: it preserves all historical copy-trading snapshots for the existing
-backtest harness and avoids a data migration on live data.
+Both adapters map to the same internal `OrderBook` type so the spread-computation logic above
+them is venue-agnostic.
+
+---
+
+### Phase 5: Cross-venue market pairing config
+
+Goal: declare which polymarket.us token maps to which Kalshi ticker.
+
+1. Add a `dislocation_pairs` config list: each entry is
+   `{polymarket_token_id, kalshi_ticker, spread_threshold_pct}`.
+2. Validate at startup that every listed token / ticker resolves in the respective registry.
+3. No signal logic here — this is pure config plumbing.
+
+---
+
+### Phase 6: Dislocation signal in observe-only mode
+
+Goal: compute spreads and log them without emitting `SignalEvent` or touching execution.
+
+1. Add `DislocaitonSignalSource` that subscribes to both `PolymarketUSIngestor` and
+   `KalshiIngestor` for each configured pair.
+2. On each tick compute the mid-price spread. Log it with `token_id`, `kalshi_ticker`,
+   `polymarket_mid`, `kalshi_mid`, `spread_pct`, `timestamp`.
+3. When spread ≥ `spread_threshold_pct`, log the breach — but do **not** call the signal
+   callback yet. `DRY_RUN=True` is enforced at the service level; observe-only mode is an
+   additional guard inside the source itself.
+4. Wire it into `service.start()` under `source_type == "dislocation"`. `TargetTracker` and
+   `reconcile_target` are not started.
+
+This phase produces enough data to calibrate thresholds before any order is ever placed.
+
+---
+
+### Phase 7: Execution adapters
+
+Goal: enable actual order submission once observe-only data confirms the strategy is sound.
+
+1. Add a `PolymarketUSExecutor` backed by `api.polymarket.us` and the polymarket-us SDK,
+   replacing `PolymarketExecutor` for the US venue.
+2. Add a `KalshiExecutor` backed by Kalshi's order-submission REST endpoints.
+3. `DislocaitonSignalSource` begins emitting `SignalEvent` (removing the observe-only guard).
+   The execution layer routes each signal to the correct executor based on `token_id` prefix /
+   venue tag.
+4. `reconcile_own()` is updated to call authenticated REST endpoints on each venue scoped to
+   the bot's own account.
+
+`DRY_RUN=True` remains the default; execution only fires when explicitly set to `False`.
 
 ---
 
