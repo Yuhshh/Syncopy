@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -44,6 +45,8 @@ class Settings(BaseSettings):
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     data_api_url: str = "https://data-api.polymarket.com"
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+    source_type: Literal["copy_trader", "dislocation"] = "copy_trader"
 
     targets: dict[str, Decimal] = Field(default_factory=dict)
     target_capitals: dict[str, Decimal] = Field(default_factory=dict)
@@ -91,25 +94,28 @@ class Settings(BaseSettings):
     @field_validator("targets")
     @classmethod
     def validate_targets(cls, value: dict[str, Decimal]) -> dict[str, Decimal]:
-        for address, weight in value.items():
-            if not ADDRESS_RE.match(address):
-                raise ValueError(f"Invalid target address: {address}")
+        for key, weight in value.items():
             if weight <= 0:
-                raise ValueError(f"Target weight must be positive: {address}")
+                raise ValueError(f"Target weight must be positive: {key}")
         return value
 
     @field_validator("target_capitals")
     @classmethod
     def validate_target_capitals(cls, value: dict[str, Decimal]) -> dict[str, Decimal]:
-        for address, capital in value.items():
-            if not ADDRESS_RE.match(address):
-                raise ValueError(f"Invalid target capital address: {address}")
+        for key, capital in value.items():
             if capital <= 0:
-                raise ValueError(f"Target capital must be positive: {address}")
+                raise ValueError(f"Target capital must be positive: {key}")
         return value
 
     @model_validator(mode="after")
     def validate_live_credentials(self) -> Settings:
+        if self.source_type == "copy_trader":
+            for address in self.targets:
+                if not ADDRESS_RE.match(address):
+                    raise ValueError(f"Invalid target address: {address}")
+            for address in self.target_capitals:
+                if not ADDRESS_RE.match(address):
+                    raise ValueError(f"Invalid target capital address: {address}")
         if not self.dry_run:
             if (
                 self.polymarket_private_key is None

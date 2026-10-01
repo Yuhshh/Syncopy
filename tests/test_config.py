@@ -28,3 +28,18 @@ def test_live_mode_requires_credentials() -> None:
 def test_target_capital_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, target_capitals=f"{ADDRESS}:0")
+
+
+def test_copy_trader_rejects_malformed_address() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            source_type="copy_trader",
+            targets="not-an-address:0.5",
+        )
+
+
+def test_dislocation_accepts_empty_targets() -> None:
+    settings = Settings(_env_file=None, source_type="dislocation", targets={})
+    assert settings.source_type == "dislocation"
+    assert settings.targets == {}
