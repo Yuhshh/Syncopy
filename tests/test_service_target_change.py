@@ -6,8 +6,6 @@ from __future__ import annotations
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 from syncopy.config import Settings
 from syncopy.domain import ZERO, Position, PriceLevel, TargetPositionChange, utcnow
 from syncopy.reconcile import Reconciler
