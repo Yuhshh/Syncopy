@@ -12,3 +12,5 @@ build/
 *.egg-info/
 .DS_Store
 backtest-output/
+.claude/
+.claude/
